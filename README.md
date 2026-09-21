@@ -1,72 +1,73 @@
-# Ego-Trajectory Reconstruction (Part A)
+# Ego-Trajectory & BEV Mapping
 
-Ego-vehicle ground-plane trajectory from the fixed traffic light.
-[`solution.py`](solution.py) · [`test_solution.py`](test_solution.py) · full write-up: [`PLAN.md`](PLAN.md)
+**Part A** — ego ground-plane trajectory from the fixed traffic light.
+**Part B** — barrels, golf cart, workers and light state, in that same frame.
+`numpy` + `matplotlib` only. Full rationale: [`PLAN.md`](PLAN.md).
 
 ```bash
 pip install -r requirements.txt
-python solution.py        # -> trajectory.png, trajectory.mp4, diagnostics.png
-python -m unittest test_solution
+python solution.py   # -> trajectory.png, trajectory.mp4, diagnostics.png
+python part_b.py     # -> bev.png, bev.mp4, detections.png
+python -m unittest test_solution test_part_b      # 60 tests, no dataset needed
 ```
 
 ![trajectory](trajectory.png)
 
-*X = start, dot = end, star = the light at the origin. The path is horizontal, not vertical
-like the sample, because the brief puts the car→light line on +X at t₀ — so the car starts on
-the −X axis with the light dead ahead.*
+## Part A — ego trajectory ([`solution.py`](solution.py))
 
-## Method
+- **Light in 3D** — median of the central 50 % of the bbox, indexed `xyz[v, u]` *not*
+  `[u, v]`, after dropping bad points and MAD-gating range outliers.
+- **Axes measured, not assumed** — "+Y right, right-handed" cannot both hold (forward ×
+  right is *down*). Correlating Y against the column index: this data is **+Y left**.
+- **World frame** — origin under the light, car→light on +X at t₀, so `p_t = −R(ψ_t)·c_t`.
+  That definition is why the path runs horizontally, unlike the sample.
+- **Heading** — no IMU, but physics is free: *a car cannot drive sideways*. With the ψ_t as
+  unknowns, that constraint gives one equation per step in one unknown, solved by bisection
+  as a forward recursion. It yields a constant heading on a straight drive, and links
+  *samples*, so frame gaps do not disturb it.
 
-1. **Detections.** Parse the bbox CSV (either header spelling), drop degenerate rows, match
-   frames to `.npz` files by globbing, not by a filename template.
-2. **Light in 3D.** Median of the central 50 % of the bbox — indexed `xyz[v, u]`, not
-   `[u, v]` — after dropping non-finite, zero and behind-camera points and MAD-gating range
-   outliers, which is what removes background leaking in around the light's silhouette.
-3. **Axes measured, not assumed.** "+X forward, +Y right, +Z up, right-handed" cannot all
-   hold: forward × right is *down*. Correlating Y against the column index and Z against the
-   row index shows this dataset is **+Y left** — right-handed, and already matching the world
-   frame. Y is flipped only if a dataset says otherwise.
-4. **World frame.** Origin under the light, +Z up through it, car→light on +X at t₀, so the
-   ego position is `p_t = −R(ψ_t)·c_t`.
-5. **Heading.** No IMU, but physics is free: **a car cannot drive sideways.** With the ψ_t as
-   unknowns (ψ₀ fixed by the frame definition), the non-holonomic constraint — the chord
-   `p_{t+1} − p_t` lies along the mean of the two headings — is one scalar equation per step
-   in one unknown, solved by bisection as a forward recursion. It returns a constant heading
-   on a straight drive, and frame gaps don't disturb it because the constraint links
-   *samples*, not consecutive frames. Positions are smoothed by local linear regression over
-   a ±6-frame *time* window; a boxcar would flatten the turn and mishandle the sparse frames.
+**Result** — 198 frames, 38–298 (8.67 s): path **29.5 m**, net yaw **+43.9°** left, mean
+speed **3.4 m/s** slowing to a near-stop, ending 8.2 m short of the light. A left-curving
+approach pulling up behind a golf cart — what the video shows.
+
+## Part B — the rest of the scene ([`part_b.py`](part_b.py))
+
+`p_t + R(ψ_t)·v` pushes any camera-frame point into that same world frame, so 198 frames
+accumulate into one map. Colour thresholds plus depth geometry; no learned model.
+
+- **Barrels / barriers** — orange, gated 0.15–1.8 m above the road (the light *housings* are
+  the same amber, but hang at 5.4 m). Static, so they accumulate over the clip and are
+  located as **density peaks**: connected components merge a whole row, because each object
+  is a dense head with a tail pointing away from where the car stood. **6 found.**
+- **Golf cart** — pale tan canopy, tracked **198/198 frames**, closing 16.9 → 5.2 m ahead.
+- **Pedestrians** — the weak layer, labelled low-confidence on the plot. Torso-band
+  clustering merges into the fence and standoff fails, because the workers stand ~1 m in
+  front of a same-height barrier. The cue that works — both wear blue — is *clip-specific*.
+- **Light state** — amber housings outvote the lamp on hue, so the lamp is isolated on
+  brightness first (V ≈ 0.85 vs 0.56). **Green on all 198 frames.**
+
+![bev](bev.png)
 
 ## Assumptions and limitations
 
-- **Planar motion** — flat ground, fixed camera pitch/roll, yaw only; height is dropped.
-- **Constant curvature within a step** — exact for an arc, close enough at 30 fps.
-- **Stereo error grows with range²**, so the earliest samples (~36 m) are least reliable — the
-  speed spike in the first ~0.3 s of `diagnostics.png`. Left in: it is a real measurement.
-- **198 of 299 frames** have depth (38–127 sparse) and 4 CSV rows are degenerate. Failing
-  frames are dropped, not interpolated.
+- **Planar motion** — flat ground, fixed pitch/roll, yaw only; the road measures 1.79 m
+  below the camera, sd 0.026 m. Constant curvature within a step: exact for an arc.
+- **Stereo error grows with range²** along the viewing ray, so distant objects smear into
+  radial streaks — one barrel scatters 0.10 m at 9–12 m but 0.81 m past 30 m. Objects are
+  located only inside 20 m (12 m for pedestrians).
+- **198 of 299 frames** have depth (0–37 absent, 38–126 sparse); 4 bbox rows are degenerate.
+  Failing frames are dropped, not interpolated.
+- Barrels and barriers are not told apart, and no object is given an extent.
 
-## Results
+## Validation — no ground truth, so every check is internal
 
-198 frames, source 38–298 (8.67 s). The car approaches on a left-curving road and pulls up
-behind a golf cart at the intersection — which is what the video shows.
-
-| | |
+| Check | Result |
 |---|---|
-| Path length | **29.5 m** (net displacement 28.3 m) |
-| Net yaw | **+43.9°**, a left turn |
-| Mean speed | **3.4 m/s** (7.6 mph), decelerating to a near-stop |
-| Extent | X ∈ [−36.2, −8.0] m, Y ∈ [−4.6, 0.0] m; ends 8.2 m short of the light |
+| Light height must be constant | **3.59 ± 0.14 m** over 198 frames |
+| Solver residual (sideslip) | **p95 0.000°** — every step bracketed |
+| Static objects must not move | per-frame centroid scatter **median 0.39 m**, p90 0.57 m |
+| Golf cart must stay ahead | 16.9 → 5.2 m, never behind us |
+| Tests | **60**, synthetic, no dataset needed |
 
-**Validation** — there is no ground truth, so the checks are internal:
-
-- *The light's height must be constant*, since a fixed light cannot move. **3.59 ± 0.14 m**
-  over 198 frames: the strongest evidence the estimator locks onto the light, not background.
-- *Solver residual* — sideslip is the constraint the heading solve drives to zero, so a step
-  it failed to bracket would surface here. **p95 0.000°.**
-- *Track identity* — the bbox centre moves smoothly and its width grows monotonically
-  20 → 88 px: one light throughout, not several on the span wire.
-- *Tests* — 24 cases, no dataset needed; recovers synthetic arcs to ~1e-4 m and pins the
-  `[v, u]` index order.
-
-`diagnostics.png` plots range, bearing, speed and recovered yaw over time.
-Part B (golf cart, barrels, pedestrians in a richer BEV) was not attempted.
+The static-object row tests *Part A*: a barrel cannot move, so a drifting trajectory would
+walk its centroid across the map. `detections.png` projects every mask back onto the RGB.

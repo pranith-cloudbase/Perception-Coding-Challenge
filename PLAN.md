@@ -1,8 +1,9 @@
-# Implementation Plan / Design Notes — Part A: Ego-Vehicle Trajectory
+# Implementation Plan / Design Notes
 
-Design document for `solution.py`. It covers **Part A only** (required): recovering the
-ego-vehicle's ground-plane trajectory `(x_m, y_m)` using the traffic light as the fixed
-world reference. Part B (placing other objects into a richer BEV) is out of scope.
+Design document for `solution.py` (**Part A** — the ego-vehicle's ground-plane trajectory
+`(x_m, y_m)` from the traffic light as fixed world reference) and for `part_b.py`
+(**Part B**, extra credit — placing the other objects into a richer BEV in that same
+frame). Sections 1-8 are Part A; section 9 is Part B.
 
 `README.md` is the one-page submission write-up. This file is the longer "why", and is the
 thing to read before changing any of the geometry.
@@ -21,8 +22,13 @@ auditable.
 ```bash
 pip install -r requirements.txt
 python solution.py                 # writes trajectory.png, diagnostics.png, trajectory.mp4
-python -m unittest -v test_solution
+python part_b.py                   # writes bev.png, bev.mp4, detections.png
+python -m unittest -v test_solution test_part_b
 ```
+
+`part_b.py` adds no dependency: `matplotlib.colors.rgb_to_hsv` does the colour
+conversion and the connected-component labelling is fifteen lines of NumPy, so
+`scipy.ndimage` stays out.
 
 ---
 
@@ -40,7 +46,8 @@ python -m unittest -v test_solution
    `depthNNNNNN.npz`. `frame_id_from_name` takes the **last** run of digits in the
    basename so a digit in the prefix can't be mistaken for the frame index.
 4. **Skip frames with no `.npz`.** In the currently downloaded subset only 198 of 299
-   frames have depth, so this is the single largest source of dropped frames.
+   frames have depth (0–37 absent, 38–126 sparse, 141 missing), so this is the single
+   largest source of dropped frames — 97 of the 101 rows dropped.
 5. **Sort by frame id**, and take the reference frame `t0` to be the first *surviving*
    frame — frame 38 here, not frame 0.
 
@@ -185,9 +192,11 @@ Nothing here has ground truth, so the checks are internal-consistency ones:
 3. **The recovered turn is visible in the RGB.** At frame 38 the road bends left ahead and
    the light cluster sits at the far left of the image; by frame 298 the car faces the
    intersection square-on. A +44° left turn is what the footage shows.
-4. **Bbox continuity.** The bbox centre moves smoothly and its width grows monotonically
-   20 → 88 px, so the CSV tracks one light throughout — no identity switch between the
-   several lights on the span wire.
+4. **Bbox continuity.** The bbox centre moves smoothly (median step 2.9 px, p95 9.1 px)
+   and its width trends 20 → 88 px as the car closes — correlation 0.93 with the frame
+   index, with a few pixels of frame-to-frame jitter on top rather than a strictly
+   monotone climb. So the CSV tracks one light throughout — no identity switch between
+   the several lights on the span wire.
 5. **Speed plausibility.** 3.4 m/s mean (7.6 mph), decelerating to a near-stop 8.2 m short
    of the light. Consistent with the video, in which the car pulls up behind a golf cart.
 6. **Unit tests** (`test_solution.py`, 24 cases, no dataset needed) cover CSV parsing, frame
@@ -207,8 +216,138 @@ Nothing here has ground truth, so the checks are internal-consistency ones:
   first ~0.3 s of `diagnostics.png`, where the sparse sampling gives the smoother little to
   work with. The estimate is left in rather than trimmed — it is a real measurement, and
   its uncertainty is part of the result.
-- **Sparse early frames.** Only 198 of 299 frames have a `.npz` in the downloaded subset,
-  and frames 38–127 are sparse. Re-running against the complete dataset needs no code
+- **Sparse early frames.** Only 198 of 299 frames have a `.npz` in the downloaded subset:
+  0–37 are missing outright, 38–126 are sparse, and 127–298 are complete apart from
+  frame 141. Re-running against the complete dataset needs no code
   change.
 - **Dropped, not interpolated.** Frames that fail any filter are simply absent.
 - **Uniform 30 fps** affects the speed/time axes and mp4 pacing, not the `(x, y)` geometry.
+
+---
+
+## 9. Part B — the rest of the scene (`part_b.py`)
+
+Part A's output is the enabling step, not just a prerequisite: once `(p_t, psi_t)` is
+known, `p_t + R(psi_t) @ v` pushes *any* camera-frame vector into the world frame, so
+198 frames of detections accumulate into one map. Substituting the car→light vector
+gives `(0, 0)` back, which is the consistency condition `test_part_b.py` pins.
+
+### 9.1 Why colour thresholding
+
+The brief invites any method. With no OpenCV and no learned model, the scene happens to
+be unusually separable: construction orange, a pale tan canopy and blue workwear are
+three non-overlapping regions of HSV, and depth supplies the height above the road that
+disambiguates the rest. Thresholds were read off this clip's histograms rather than
+guessed, and `classify_colour` applies orange last so it wins any overlap with tan.
+
+The single most load-bearing filter is **height above the ground plane**, not colour.
+The ground is the median Z within 12 m (the road is overwhelmingly the commonest thing
+there): -1.79 m, sd 0.026 m across the clip, which is also the hard evidence for the
+flat-ground assumption Part A already leans on. Height then separates the barrels
+(0.15-1.8 m) from the traffic-light housings, which are *the same amber* but hang at
+5.4 m and would otherwise be mapped as road furniture.
+
+### 9.2 Static objects: accumulate, then peak-pick
+
+Barrels do not move, so every frame that sees one should place it at the same world
+point, and 198 observations beat any single frame. The accumulated cloud is clustered
+in the **world** frame rather than per frame, so stereo speckle - which does not repeat
+in the same world cell - falls below the density floor.
+
+Locating objects in that cloud is **peak-picking, not connected components**. The raw
+cloud shows why: each object is a dense head with a faint radial tail pointing away from
+wherever the car was standing when it saw it, and the tails of neighbouring barrels
+touch. Connected components swallow a whole row into one blob; the density *maxima* stay
+one per object. Along the barrel line the counts run 26k / 22k / 26k at the heads and
+drop to ~150 in the gaps. `floor` is an absolute count, not a fraction of the global
+maximum, so an object seen briefly is not suppressed by one seen for the whole clip.
+
+### 9.3 Range gates, set from measured error
+
+Stereo depth error grows with range squared and is spent along the viewing ray. Measured
+by re-observing one isolated barrel from every pose that saw it, the per-frame centroid
+scatter runs:
+
+| observation range | 9-12 m | 12-22 m | 22-30 m | 30-45 m |
+|---|---|---|---|---|
+| centroid scatter | 0.10 m | ~0.30 m | 0.58 m | 0.81 m |
+
+So discrete object positions are taken only from observations inside **20 m**, and
+pedestrians - a far weaker signal - inside **12 m**. The raw cloud is still drawn at
+every range, faintly, because the streaks are honest evidence of that error rather than
+something to hide. The gates are the reason the markers sit on the dense heads instead
+of drifting into the tails.
+
+### 9.4 The golf cart
+
+Tracked by its tan canopy and bench seats, scored by big-and-near, with a 6 m gate
+against the previous detection so a one-frame flicker onto distant gravel cannot steal
+the track. Found in **198/198 frames**, closing 16.9 m -> 5.2 m at a median 1.63 m/s
+(3.6 mph).
+
+Deliberately *not* a driving-corridor detector ("nearest obstacle within +-2.5 m of the
+camera axis"), which was tried first and fails: the ego turns 44 deg through this clip,
+so a fixed camera-frame corridor loses the cart in the first third where it sits 25 deg
+off-axis.
+
+### 9.5 Pedestrians — the weak layer, and why
+
+Two better-motivated detectors were tried and both failed on properties of the scene:
+
+1. **Torso-band clustering** (points 1.0-2.0 m above the road, keep narrow clusters).
+   The chain-link fence behind the workers spans the whole image at exactly that height,
+   so every cluster merges into it.
+2. **Background standoff** (keep points closer than the smoothed per-column background
+   depth). This does suppress the fence, but the workers stand immediately in front of a
+   white jersey barrier of near-identical height, ~1 m behind them - inside the stereo
+   noise at 11 m. What survived the gates was overwhelmingly poles and fence posts,
+   recognisable because their height saturates the search band where a person's does not.
+
+What does work is that both workers wear blue and nothing else at road height in this
+scene is blue. Inside 12 m the 18 surviving detections land in a 0.6 x 1.9 m patch centred on
+world (2.6, 1.6) - the 1.9 m along Y being the gap between the two workers, not
+error; past 15 m they scatter over 30 m of map. That is honest colour
+thresholding of the kind the brief invites, but it is **clip-specific** in a way the
+barrel and cart detectors are not - a worker in an orange hi-vis vest would be missed, or
+worse, logged as a barrel. The layer is drawn in neutral ink with its own marker shape
+and labelled "low confidence" on the plot rather than being passed off as equivalent.
+
+### 9.6 Traffic-light state
+
+The housings in this clip are amber, so hue alone gets it backwards: the housing fills
+far more of the bbox than the lamp and outvotes it. The lit lamp separates on
+**brightness** instead - V ~ 0.85 against the housing's ~0.56 - so a V > 0.75 gate
+isolates it before hue is consulted. Reads green on all 198 frames, which matches the
+footage, and the green lamp's position in the bottom third of the bbox is the
+independent confirmation.
+
+### 9.7 Outputs and the check that has teeth
+
+- **`bev.png`** - two panels. One view cannot do the job: the car covers 29 m of approach
+  while every object it maps sits in a 15 m box around the intersection, so a single
+  equal-aspect view containing the whole drive renders the scene as a smudge in a corner.
+- **`bev.mp4`** - the map filling in over time on the source frame grid, showing only what
+  has been *observed* by frame t, the way an online system would see it.
+- **`detections.png`** - every mask projected back onto the RGB it came from. A BEV can
+  look tidy and still point at the wrong pixels; this is the figure to check first.
+
+The validation that matters is `static_consistency`, and it is a check on **Part A**: a
+barrel cannot move, so the spread of its *per-frame centroids* isolates trajectory error
+from object size (a 2 m barrier is 2 m wide from every pose, but a drifting trajectory
+walks its centroid across the map). Measured: median **0.39 m**, p90 0.57 m over the 6
+objects. Supporting checks: the golf cart stays ahead of the ego vehicle for the whole
+clip and never implies a speed a golf cart could not do, and the ground plane holds to
+sd 0.026 m.
+
+### 9.8 Part B limitations
+
+- **Objects are mapped only where the car passed close enough.** The 20 m gate is a real
+  loss of coverage - barrel rows seen only from 30 m+ early in the clip are in the faint
+  cloud but get no marker.
+- **Barrels and jersey barriers are not told apart.** Both are orange road furniture at
+  the same height; only footprint separates them, and the rows merge.
+- **Pedestrian recall is low and the cue is clip-specific** (see 9.5).
+- **No object is given an extent or an orientation**, per the brief's "just plot the
+  centers of the regions visible in the BEV".
+- **`part_b_cache.npz` is derived**, gitignored, and rebuilt with `--refresh`; only the
+  raw scan is cached, so re-tuning the locator's gates does not mean re-scanning imagery.

@@ -36,7 +36,7 @@ import sys
 import numpy as np
 
 # --------------------------------------------------------------------------
-# Palette (validated for CVD separation on a light surface; see README).
+# Palette (validated for CVD separation on a light surface; see PLAN.md §6).
 # --------------------------------------------------------------------------
 C_PATH = "#2a78d6"    # categorical slot 1 - the ego trajectory
 C_START = "#eb6834"   # categorical slot 2 - start marker
